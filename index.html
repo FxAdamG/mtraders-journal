@@ -2652,7 +2652,7 @@ body.loading .container { visibility: hidden; }
                     </div>
                     <div class="form-group">
                         <label>R:R Secured</label>
-                        <input type="number" id="rrSecured" step="0.01" min="0" placeholder="e.g. 2.50">
+                        <input type="number" id="rrSecured" step="0.01" placeholder="e.g. -1, 2.50">
                     </div>
                     <div class="form-group pnl-input">
                         <label>P&L ($)</label>
@@ -3632,9 +3632,11 @@ function saveTradeEdit() {
         return;
     }
     
-    // Use manually entered R:R value from edit form
-    const rrSecuredEdit = parseFloat(document.getElementById('editRrSecured') ? document.getElementById('editRrSecured').value : '') || 0;
-    const rrRatio = rrSecuredEdit > 0 ? rrSecuredEdit.toFixed(2) : 'N/A';
+    // Use manually entered R:R value from edit form (allow negatives like -1)
+    const editRrEl = document.getElementById('editRrSecured');
+    const editRrRaw = editRrEl ? editRrEl.value.trim() : '';
+    const rrSecuredEdit = editRrRaw !== '' ? parseFloat(editRrRaw) : NaN;
+    const rrRatio = (!isNaN(rrSecuredEdit)) ? rrSecuredEdit.toFixed(2) : 'N/A';
     
     // Update the trade object
     const trade = trades[currentEditIndex];
@@ -4180,8 +4182,8 @@ function addTrade() {
     const pnl = parseFloat(document.getElementById('pnl').value);
     const notes = document.getElementById('notes').value.trim();
 
-    // Use manually entered R:R value
-    const rrRatio = rrSecured > 0 ? rrSecured.toFixed(2) : 'N/A';
+    // Use manually entered R:R value (allow negatives, e.g. -1 for a loss)
+    const rrRatio = (!isNaN(rrSecured) && document.getElementById('rrSecured').value.trim() !== '') ? rrSecured.toFixed(2) : 'N/A';
 
     // Determine result based on manual P&L
     let result;
@@ -4423,8 +4425,8 @@ function updateAdvancedMetrics(monthlyTrades = trades) {
     document.getElementById('avgLoss').textContent = `-$${avgLoss.toFixed(2)}`;
     document.getElementById('avgLoss').parentElement.className = 'stat-card-enhanced negative';
     
-    // Average R:R - based on trades with valid numeric RR only
-    const validRRTrades = trades.filter(trade => trade.rrRatio && trade.rrRatio !== 'N/A' && parseFloat(trade.rrRatio) > 0);
+    // Average R:R - based on trades with valid numeric RR only (includes negatives like -1 for losses)
+    const validRRTrades = trades.filter(trade => trade.rrRatio && trade.rrRatio !== 'N/A' && !isNaN(parseFloat(trade.rrRatio)));
     const avgRR = validRRTrades.length > 0 ? 
         validRRTrades.reduce((sum, trade) => sum + parseFloat(trade.rrRatio), 0) / validRRTrades.length : 0;
     
@@ -4716,7 +4718,7 @@ function showTradeDetails(index) {
             </div>
             <div class="form-group">
                 <label for="editRrSecured">R:R Secured</label>
-                <input type="number" id="editRrSecured" step="0.01" min="0" placeholder="e.g. 2.50">
+                <input type="number" id="editRrSecured" step="0.01" placeholder="e.g. -1, 2.50">
             </div>
         </div>
         
