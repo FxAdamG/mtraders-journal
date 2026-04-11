@@ -211,9 +211,21 @@ body {
     line-height: 1.6;
     min-height: 100vh;
     overflow-x: hidden;
+    /* FIX: background-attachment:fixed was causing full repaint on every scroll pixel.
+       Using a pseudo-element instead keeps the grid fixed without triggering repaints. */
     background-image:
         radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0,212,170,0.06) 0%, transparent 60%),
-        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(59,130,246,0.04) 0%, transparent 50%),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(59,130,246,0.04) 0%, transparent 50%);
+}
+
+/* Separate the expensive repeating grid into its own composited layer */
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
         repeating-linear-gradient(
             0deg, transparent,
             transparent 39px,
@@ -226,6 +238,7 @@ body {
             rgba(255,255,255,0.015) 39px,
             rgba(255,255,255,0.015) 40px
         );
+    will-change: transform; /* promote to its own GPU layer */
 }
 
 /* ── CONTAINER ─────────────────────────── */
@@ -233,6 +246,8 @@ body {
     max-width: 1440px;
     margin: 0 auto;
     padding: 24px 24px 96px;
+    position: relative;
+    z-index: 1; /* sit above the fixed grid pseudo-element */
 }
 
 /* ══════════════════════════════════════════
@@ -316,6 +331,8 @@ body {
     overflow: hidden;
     transition: transform var(--t-fast) var(--ease), border-color var(--t-fast);
     cursor: default;
+    will-change: transform; /* GPU-accelerated hover lift */
+    contain: layout style; /* prevent layout thrash from neighbors */
 }
 .stat-card::before {
     content: '';
@@ -725,7 +742,7 @@ td {
     white-space: nowrap;
     font-family: var(--font-mono);
 }
-.trade-row { cursor: pointer; transition: background var(--t-fast); }
+.trade-row { cursor: pointer; transition: background var(--t-fast); will-change: background-color; }
 .trade-row:hover { background: var(--bg-hover); }
 
 /* Direction badges */
@@ -2731,9 +2748,11 @@ body.loading .container { visibility: hidden; }
                     <div class="equity-chart-subtitle" id="equityTradeCount">—</div>
                 </div>
                 <div class="chart-controls" style="display:flex;gap:6px;align-items:center;">
+                    <span id="zoomLevelLabel" style="font-size:10px;color:var(--text-ghost);font-family:var(--font-mono);margin-right:4px;min-width:38px;text-align:right;">100%</span>
                     <button class="zoom-btn" onclick="zoomChart(-1)" title="Zoom out">−</button>
                     <button class="zoom-btn" onclick="zoomChart(1)" title="Zoom in">+</button>
                     <button class="zoom-btn" onclick="resetZoom()" title="Reset zoom" style="width:auto;padding:0 10px;font-size:10px;letter-spacing:0.5px;text-transform:uppercase;font-family:var(--font-ui);">Reset</button>
+                    <span style="font-size:10px;color:var(--text-ghost);font-family:var(--font-mono);margin-left:4px;opacity:0.6;">drag to pan</span>
                 </div>
             </div>
             <div class="chart-canvas-container" style="position: relative;">
@@ -3148,7 +3167,9 @@ function loadData() {
             }
             updateDataStatus(true);
         } else {
+            // No saved data — start fresh with empty journal
             trades = [];
+            transactions = [];
             balance = STARTING_BALANCE;
         }
     } catch (error) {
@@ -3160,7 +3181,7 @@ function loadData() {
     // Restore _seq counter so new entries don't collide
     const maxTradeSeq = trades.reduce((m, t) => t._seq != null && t._seq > m ? t._seq : m, -1);
     const maxTxSeq = transactions.reduce((m, t) => t._seq != null && t._seq > m ? t._seq : m, -1);
-    _seq = Math.max(maxTradeSeq, maxTxSeq) + 1;
+    _seq = Math.max(_seq || 0, maxTradeSeq, maxTxSeq) + 1;
 }
 
         function showDataStatus(message, type) {
@@ -3177,12 +3198,16 @@ function loadData() {
 
         function updateDataStatus(hasData) {
             const title = document.querySelector('.title');
+            if (!title) return;
             if (hasData && trades.length > 0) {
+                // Brief teal flash, then revert to CSS-defined color (never override to near-black)
                 title.style.color = '#00d4aa';
                 title.title = `Data loaded (${trades.length} trades)`;
                 setTimeout(() => {
-                    title.style.color = '#131722';
+                    title.style.color = ''; // remove inline style → CSS var(--text-white) takes over
                 }, 2000);
+            } else {
+                title.style.color = '';
             }
         }
 
@@ -3378,11 +3403,12 @@ function filterTrades(filterType, buttonElement = null) {
 
 function updateFilteredTable() {
     const tbody = document.getElementById('tradesTable');
-    tbody.innerHTML = '';
+    // Build in a fragment — only one reflow instead of one per row
+    const frag = document.createDocumentFragment();
 
     filteredTrades.forEach((trade, index) => {
         const originalIndex = trades.indexOf(trade);
-        const row = tbody.insertRow();
+        const row = document.createElement('tr');
         row.className = 'trade-row';
         row.onclick = () => showTradeDetails(originalIndex);
         
@@ -3414,7 +3440,11 @@ function updateFilteredTable() {
             <td>$${trade.balance.toFixed(2)}</td>
             <td><button class="delete-btn" onclick="event.stopPropagation(); deleteTrade(${originalIndex})">Delete</button></td>
         `;
+        frag.appendChild(row);
     });
+
+    tbody.innerHTML = '';          // single clear
+    tbody.appendChild(frag);       // single insert
 }
 
 function updateFilterCount() {
@@ -3796,25 +3826,18 @@ function initTransactions() {
         addTransaction();
     });
     
-    // Initialize filter to "week"
+    // Apply the default "week" filter against whatever transactions are loaded
     currentTransactionFilter = 'week';
-    filteredTransactions = [...transactions]; // Initialize filtered array
-    filterTransactions('week');
-    updateTransactionsTable();
+    filterTransactions('week'); // this sets filteredTransactions correctly and calls updateTransactionsTable
     
     // Set the active button to "This Week" after DOM is ready
     setTimeout(() => {
         const weekButton = document.querySelector('.withdrawals-section .filter-btn[onclick*="week"]');
         if (weekButton) {
+            document.querySelectorAll('.withdrawals-section .filter-btn').forEach(btn => btn.classList.remove('active'));
             weekButton.classList.add('active');
         }
-        // Remove active class from others
-        document.querySelectorAll('.withdrawals-section .filter-btn').forEach(btn => {
-            if (btn !== weekButton) {
-                btn.classList.remove('active');
-            }
-        });
-    }, 100);
+    }, 50);
 }
 
 // Load withdrawal data from localStorage
@@ -4034,39 +4057,49 @@ function updateTransactionsTable() {
         return;
     }
     
-    tbody.innerHTML = '';
-    
-    // Use filtered transactions or all transactions
-    const displayTransactions = filteredTransactions.length > 0 ? filteredTransactions : transactions;
+    const displayTransactions = currentTransactionFilter === 'all' ? [...transactions] : filteredTransactions;
     countElement.textContent = `${displayTransactions.length} transaction${displayTransactions.length !== 1 ? 's' : ''}`;
     
-    // Sort by date (newest first) and display
+    // Sort by date (newest first)
     const sortedTransactions = [...displayTransactions].sort((a, b) => new Date(b.date) - new Date(a.date));
     
-    sortedTransactions.forEach((transaction, index) => {
-        const row = tbody.insertRow();
+    // Build with a fragment — one reflow instead of one per row
+    const frag = document.createDocumentFragment();
+
+    if (sortedTransactions.length === 0) {
+        const emptyRow = document.createElement('tr');
+        const filterLabel = { week: 'this week', month: 'this month', '3months': 'the last 3 months', all: 'yet' };
+        emptyRow.innerHTML = `<td colspan="9" style="text-align:center;padding:28px 0;color:var(--text-ghost);font-size:12px;font-family:var(--font-mono);">No transactions for ${filterLabel[currentTransactionFilter] || 'this period'}</td>`;
+        frag.appendChild(emptyRow);
+    } else {
+        sortedTransactions.forEach((transaction) => {
+        const row = document.createElement('tr');
         row.className = 'transaction-row';
         
         const typeClass = `transaction-type-${transaction.type}`;
         const amountClass = transaction.type === 'deposit' ? 'transaction-amount positive' : 'transaction-amount negative';
         const amountDisplay = transaction.type === 'deposit' ? `+$${transaction.amount.toFixed(2)}` : `-$${transaction.amount.toFixed(2)}`;
         
-        // Find the original index in the full transactions array for deletion
         const originalIndex = transactions.findIndex(t => t.id === transaction.id);
         
-row.onclick = () => showTransactionDetails(transaction);
-row.innerHTML = `
-    <td>${transaction.date}</td>
-    <td><span class="${typeClass}">${transaction.type}</span></td>
-    <td class="${amountClass}">${amountDisplay}</td>
-    <td>${transaction.category}</td>
-    <td>$${transaction.balanceBefore.toFixed(2)}</td>
-    <td>$${transaction.balanceAfter.toFixed(2)}</td>
-    <td>${transaction.impact}%</td>
-    <td>${transaction.notes || 'N/A'}</td>
-    <td><button class="delete-btn" onclick="event.stopPropagation(); deleteTransaction(${originalIndex})">Delete</button></td>
-`;
-    });
+        row.onclick = () => showTransactionDetails(transaction);
+        row.innerHTML = `
+            <td>${transaction.date}</td>
+            <td><span class="${typeClass}">${transaction.type}</span></td>
+            <td class="${amountClass}">${amountDisplay}</td>
+            <td>${transaction.category}</td>
+            <td>$${transaction.balanceBefore.toFixed(2)}</td>
+            <td>$${transaction.balanceAfter.toFixed(2)}</td>
+            <td>${transaction.impact}%</td>
+            <td>${transaction.notes || 'N/A'}</td>
+            <td><button class="delete-btn" onclick="event.stopPropagation(); deleteTransaction(${originalIndex})">Delete</button></td>
+        `;
+        frag.appendChild(row);
+        }); // end forEach
+    } // end else
+
+    tbody.innerHTML = '';
+    tbody.appendChild(frag);
 }
 
 function calculateTransactionImpact() {
@@ -5465,13 +5498,14 @@ function drawEnhancedChart(canvasId, tooltipId) {
     drawBaselineLine(ctx, canvas, padding, scaleY);
     const curvePositions = drawEquityCurve(ctx, visibleEvents, scaleX, scaleY);
     drawTransactionMarkers(ctx, visibleEvents, scaleX, scaleY, curvePositions);
-    drawAxisLabels(ctx, canvas, padding, paddedMin, paddedMax, maxX, scaleX, minX);
+    drawAxisLabels(ctx, canvas, padding, paddedMin, paddedMax, maxX, scaleX, minX, visibleEvents);
 
     // Clean up old listeners via AbortController
     if (canvas._interactionAbort) canvas._interactionAbort.abort();
     const ac = new AbortController();
     canvas._interactionAbort = ac;
     addChartInteraction(canvas, visibleEvents, scaleX, scaleY, tooltip, curvePositions, ac.signal);
+    canvas.style.cursor = 'grab'; // signal to user that chart is pannable
 }
 
 function drawChartBackground(ctx, canvas, padding, scaleX, maxX, minX = 0) {
@@ -5665,22 +5699,26 @@ function drawEquityCurve(ctx, allEvents, scaleX, scaleY) {
 
 function drawTransactionMarkers(ctx, allEvents, scaleX, scaleY, curvePositions) {
     if (!curvePositions || !curvePositions.length) return;
-    const chartBottom = ctx.canvas.height - 60;
     allEvents.forEach((event, i) => {
         if (event.eventType !== 'transaction') return;
         const pos = curvePositions[i];
         if (!pos) return;
-        const color = event.type === 'deposit' ? '#00c896' : '#ff5f5f';
-        ctx.save();
-        ctx.setLineDash([4, 3]);
-        ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.7;
-        ctx.beginPath(); ctx.moveTo(pos.x, pos.y); ctx.lineTo(pos.x, chartBottom); ctx.stroke();
-        ctx.restore();
-        ctx.save();
-        ctx.translate(pos.x, pos.y); ctx.rotate(Math.PI / 4);
-        ctx.fillStyle = color; ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.rect(-4, -4, 8, 8); ctx.fill(); ctx.stroke();
-        ctx.restore();
+        const color = event.type === 'deposit' ? '#00d4aa' : '#ff4f6d';
+        // Outer ring
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 5, 0, Math.PI * 2);
+        ctx.strokeStyle = color;
+        ctx.lineWidth   = 1.5;
+        ctx.globalAlpha = 0.5;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        // Solid inner dot
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle   = color;
+        ctx.globalAlpha = 0.9;
+        ctx.fill();
+        ctx.globalAlpha = 1;
     });
 }
 
@@ -5690,7 +5728,8 @@ function getCurvePositionForEvent(allEvents, scaleX, scaleY, eventIndex, curvePo
     return { x: scaleX(ev.x), y: scaleY(ev.balance) };
 }
 
-function drawAxisLabels(ctx, canvas, padding, paddedMin, paddedMax, maxX, scaleX, minX = 0) {
+function drawAxisLabels(ctx, canvas, padding, paddedMin, paddedMax, maxX, scaleX, minX = 0, allEvents = []) {
+    // ── Y-axis: balance labels ──────────────────────────────────────────────
     ctx.fillStyle = '#3d4e63';
     ctx.font = '11px "JetBrains Mono", monospace';
     ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
@@ -5701,19 +5740,54 @@ function drawAxisLabels(ctx, canvas, padding, paddedMin, paddedMax, maxX, scaleX
         const y = canvas.height - padding - ((bal - paddedMin) / (paddedMax - paddedMin)) * (canvas.height - 2 * padding);
         ctx.fillText(bal >= 1000 ? `$${(bal/1000).toFixed(1)}k` : `$${bal.toFixed(0)}`, padding - 8, y);
     }
+
+    // ── X-axis: trade numbers + date below ─────────────────────────────────
     ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-    ctx.font = '10px "JetBrains Mono", monospace'; ctx.fillStyle = '#3d4e63';
+
+    // Build a lookup: trade number -> date string (from allEvents)
+    const tradeDateMap = {};
+    allEvents.forEach(ev => {
+        if (ev.eventType === 'trade' && ev.date) {
+            tradeDateMap[Math.round(ev.x)] = ev.date;
+        }
+    });
+
     const range = maxX - minX || 1;
     const stepSize = Math.max(1, Math.ceil(range / 8));
     for (let i = Math.ceil(minX); i <= maxX; i += stepSize) {
-        ctx.fillText(i === 0 ? 'Start' : `#${i}`, scaleX(i), canvas.height - padding + 6);
+        const x = scaleX(i);
+        if (x < padding || x > canvas.width - padding) continue;
+
+        // Trade number label
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.fillStyle = '#3d4e63';
+        ctx.fillText(i === 0 ? 'Start' : `#${i}`, x, canvas.height - padding + 6);
+
+        // Date label below — dimmer, smaller
+        const dateStr = tradeDateMap[i];
+        if (dateStr) {
+            const d = new Date(dateStr + 'T00:00:00');
+            const mon = d.toLocaleString('en-US', { month: 'short' });
+            const day = String(d.getDate()).padStart(2, '0');
+            ctx.font = '9px "JetBrains Mono", monospace';
+            ctx.fillStyle = '#2a3a4d';
+            ctx.fillText(`${mon} ${day}`, x, canvas.height - padding + 18);
+        }
     }
 }
 
 function addChartInteraction(canvas, allEvents, scaleX, scaleY, tooltip, curvePositions, signal) {
     const HIT_RADIUS = 12;
-    const padding = 60;
-    const opts = signal ? { signal } : {};
+    const padding    = 60;
+    const opts       = signal ? { signal } : {};
+
+    // ── Cache transaction dot positions once (O(1) per frame after this) ──
+    const dotPositions = [];
+    allEvents.forEach((ev, idx) => {
+        if (ev.eventType !== 'transaction') return;
+        const pos = getCurvePositionForEvent(allEvents, scaleX, scaleY, idx, curvePositions);
+        dotPositions.push({ pos, ev });
+    });
 
     function getNearestEvent(mouseX) {
         let nearest = null, minDist = Infinity;
@@ -5724,99 +5798,190 @@ function addChartInteraction(canvas, allEvents, scaleX, scaleY, tooltip, curvePo
         return nearest;
     }
 
+    // ── PAN — mousedown only; move/up handled by global listeners ─────────
+    canvas.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        const rect  = canvas.getBoundingClientRect();
+        const cx    = (e.clientX - rect.left);
+        const scale = canvas.width / rect.width;
+        if (cx * scale < padding || cx * scale > canvas.width - padding) return;
+
+        _pan.active    = true;
+        _pan.didPan    = false;
+        _pan.startX    = e.clientX;
+        _pan.startZoom = { start: _chartZoom.start, end: _chartZoom.end };
+        canvas.style.cursor = 'grabbing';
+        e.preventDefault();
+    }, opts);
+
+    // ── CLICK — only fire if we didn't drag ───────────────────────────────
     canvas.addEventListener('click', function(e) {
+        if (_pan.didPan) { _pan.didPan = false; return; }   // was a drag, not a click
         const rect = canvas.getBoundingClientRect();
         const ratio = canvas.width / rect.width;
         const mx = (e.clientX - rect.left) * ratio;
-        const my = (e.clientY - rect.top) * ratio;
+        const my = (e.clientY - rect.top)  * ratio;
         let found = null, minDist = Infinity;
-        allEvents.forEach((ev, idx) => {
-            if (ev.eventType !== 'transaction') return;
-            const pos = getCurvePositionForEvent(allEvents, scaleX, scaleY, idx, curvePositions);
-            const d = Math.sqrt((mx - pos.x) ** 2 + (my - pos.y) ** 2);
+        for (const { pos, ev } of dotPositions) {
+            const dx = mx - pos.x, dy = my - pos.y;
+            const d  = Math.sqrt(dx*dx + dy*dy);
             if (d <= HIT_RADIUS && d < minDist) { found = ev; minDist = d; }
-        });
+        }
         if (found) showTransactionDetails(found);
     }, opts);
 
+    // ── HOVER tooltip — rAF-throttled ─────────────────────────────────────
+    let _rafId = null;
     canvas.addEventListener('mousemove', function(e) {
-        const rect = canvas.getBoundingClientRect();
-        const ratio = canvas.width / rect.width;
-        const mx = (e.clientX - rect.left) * ratio;
-        const my = (e.clientY - rect.top) * ratio;
+        if (_pan.active) return;                  // no tooltip while panning
+        if (_rafId) return;
+        _rafId = requestAnimationFrame(() => {
+            _rafId = null;
+            const rect  = canvas.getBoundingClientRect();
+            const ratio = canvas.width / rect.width;
+            const mx = (e.clientX - rect.left) * ratio;
+            const my = (e.clientY - rect.top)  * ratio;
 
-        if (mx < padding || mx > canvas.width - padding || my < padding || my > canvas.height - padding) {
-            if (tooltip) tooltip.style.display = 'none';
-            canvas.style.cursor = 'crosshair';
-            return;
-        }
+            if (mx < padding || mx > canvas.width - padding || my < padding || my > canvas.height - padding) {
+                if (tooltip) tooltip.style.display = 'none';
+                if (!_pan.active) canvas.style.cursor = 'grab';
+                return;
+            }
 
-        let onDot = false;
-        allEvents.forEach((ev, idx) => {
-            if (ev.eventType !== 'transaction') return;
-            const pos = getCurvePositionForEvent(allEvents, scaleX, scaleY, idx, curvePositions);
-            if (Math.sqrt((mx - pos.x) ** 2 + (my - pos.y) ** 2) <= HIT_RADIUS) onDot = true;
+            let onDot = false;
+            for (const { pos } of dotPositions) {
+                const dx = mx - pos.x, dy = my - pos.y;
+                if (dx*dx + dy*dy <= HIT_RADIUS*HIT_RADIUS) { onDot = true; break; }
+            }
+            canvas.style.cursor = onDot ? 'pointer' : 'grab';
+
+            const nearest = getNearestEvent(mx);
+            if (!nearest || !tooltip) return;
+            const { event } = nearest;
+            const pnlChange = event.eventType === 'trade'
+                ? event.pnl
+                : (event.type === 'deposit' ? event.amount : -event.amount);
+            const pnlColor = pnlChange >= 0 ? 'var(--green)' : 'var(--red)';
+            const balColor = event.balance >= STARTING_BALANCE ? 'var(--green)' : 'var(--red)';
+            const label    = event.eventType === 'start' ? 'Start'
+                           : event.eventType === 'trade' ? `Trade #${event.trade || ''}`
+                           : event.type === 'deposit'   ? 'Deposit' : 'Withdrawal';
+
+            let rows = `<div class="tooltip-row"><span class="tooltip-label">${label}</span><span class="tooltip-value">${event.symbol || event.category || '—'}</span></div>
+                        <div class="tooltip-divider"></div>
+                        <div class="tooltip-row"><span class="tooltip-label">Balance</span><span class="tooltip-value" style="color:${balColor}">$${event.balance.toFixed(2)}</span></div>`;
+            if (event.eventType !== 'start')
+                rows += `<div class="tooltip-row"><span class="tooltip-label">Change</span><span class="tooltip-value" style="color:${pnlColor}">${pnlChange >= 0 ? '+' : ''}$${Math.abs(pnlChange).toFixed(2)}</span></div>`;
+            if (event.date)
+                rows += `<div class="tooltip-row"><span class="tooltip-label">Date</span><span class="tooltip-value">${event.date}</span></div>`;
+
+            tooltip.innerHTML = rows;
+            tooltip.style.display = 'block';
+            const tw = 180, th = tooltip.offsetHeight || 100;
+            const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+            let left = cx + 14, top = cy - th / 2;
+            if (left + tw > rect.width - 8)  left = cx - tw - 14;
+            if (top < 4)                      top  = 4;
+            if (top + th > rect.height - 4)  top  = rect.height - th - 4;
+            tooltip.style.left = left + 'px';
+            tooltip.style.top  = top  + 'px';
         });
-        canvas.style.cursor = onDot ? 'pointer' : 'crosshair';
-
-        const nearest = getNearestEvent(mx);
-        if (!nearest || !tooltip) return;
-        const { event } = nearest;
-        const pnlChange = event.eventType === 'trade' ? event.pnl : (event.type === 'deposit' ? event.amount : -event.amount);
-        const pnlColor = pnlChange >= 0 ? 'var(--green)' : 'var(--red)';
-        const balColor = event.balance >= STARTING_BALANCE ? 'var(--green)' : 'var(--red)';
-        const label = event.eventType === 'start' ? 'Start' : event.eventType === 'trade' ? `Trade #${event.trade || ''}` : event.type === 'deposit' ? 'Deposit' : 'Withdrawal';
-
-        let rows = `<div class="tooltip-row"><span class="tooltip-label">${label}</span><span class="tooltip-value">${event.symbol || event.category || '—'}</span></div><div class="tooltip-divider"></div><div class="tooltip-row"><span class="tooltip-label">Balance</span><span class="tooltip-value" style="color:${balColor}">$${event.balance.toFixed(2)}</span></div>`;
-        if (event.eventType !== 'start') rows += `<div class="tooltip-row"><span class="tooltip-label">Change</span><span class="tooltip-value" style="color:${pnlColor}">${pnlChange >= 0 ? '+' : ''}$${Math.abs(pnlChange).toFixed(2)}</span></div>`;
-        if (event.date) rows += `<div class="tooltip-row"><span class="tooltip-label">Date</span><span class="tooltip-value">${event.date}</span></div>`;
-
-        tooltip.innerHTML = rows;
-        tooltip.style.display = 'block';
-        const tw = 180, th = tooltip.offsetHeight || 100;
-        const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
-        let left = cx + 14, top = cy - th / 2;
-        if (left + tw > rect.width - 8) left = cx - tw - 14;
-        if (top < 4) top = 4;
-        if (top + th > rect.height - 4) top = rect.height - th - 4;
-        tooltip.style.left = left + 'px';
-        tooltip.style.top = top + 'px';
     }, opts);
 
     canvas.addEventListener('mouseleave', function() {
-        canvas.style.cursor = 'default';
+        if (!_pan.active) canvas.style.cursor = 'default';
         if (tooltip) tooltip.style.display = 'none';
     }, opts);
 
-    // Mouse-wheel zoom on the chart
+    // ── SCROLL-WHEEL ZOOM — anchored to mouse position ────────────────────
+    let _wheelRafId = null;
     canvas.addEventListener('wheel', function(e) {
         e.preventDefault();
         const rect = canvas.getBoundingClientRect();
-        const mouseXRatio = (e.clientX - rect.left) / rect.width;
-        const zoomFactor = e.deltaY < 0 ? 0.85 : 1.15;
-        const span = _chartZoom.end - _chartZoom.start;
-        const newSpan = Math.min(1, Math.max(0.05, span * zoomFactor));
-        const center = _chartZoom.start + mouseXRatio * span;
-        _chartZoom.start = Math.max(0, center - mouseXRatio * newSpan);
-        _chartZoom.end   = Math.min(1, _chartZoom.start + newSpan);
-        if (_chartZoom.end > 1) { _chartZoom.end = 1; _chartZoom.start = Math.max(0, 1 - newSpan); }
-        clearTimeout(_chartDebounce);
-        _chartDebounce = setTimeout(updateChart, 30);
+
+        // Map mouse X to the DATA area only (strip padding on both sides)
+        const paddingPx  = padding * (rect.width / canvas.width);
+        const dataLeft   = paddingPx;
+        const dataRight  = rect.width - paddingPx;
+        const dataWidth  = dataRight - dataLeft;
+        // clamp so hovering over the axis labels still anchors at the edge
+        const mouseInData = Math.max(0, Math.min(dataWidth, (e.clientX - rect.left) - dataLeft));
+        const mouseRatio  = mouseInData / dataWidth;  // 0–1 within the data region
+
+        const zoomFactor  = e.deltaY < 0 ? 0.85 : 1.18;
+        const span        = _chartZoom.end - _chartZoom.start;
+        const newSpan     = Math.min(1, Math.max(0.03, span * zoomFactor));
+
+        // Keep the data point under the cursor stationary
+        const anchor  = _chartZoom.start + mouseRatio * span;
+        let newStart  = anchor - mouseRatio * newSpan;
+        let newEnd    = newStart + newSpan;
+        if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+        if (newEnd   > 1) { newStart -= (newEnd - 1); newEnd = 1; }
+        _chartZoom.start = Math.max(0, newStart);
+        _chartZoom.end   = Math.min(1, newEnd);
+
+        // Use rAF for smooth zoom (no debounce delay)
+        if (_wheelRafId) cancelAnimationFrame(_wheelRafId);
+        _wheelRafId = requestAnimationFrame(() => { _wheelRafId = null; updateChart(); });
     }, { passive: false, ...(signal ? { signal } : {}) });
 }
 
-
-// Zoom state — [0,1] fractional viewport over allEvents
+// ── Zoom state — [0,1] fractional viewport ───────────────────────────────
 let _chartZoom = { start: 0, end: 1 };
 
-function zoomChart(dir) {
-    const span = _chartZoom.end - _chartZoom.start;
-    const center = (_chartZoom.start + _chartZoom.end) / 2;
-    const newSpan = Math.min(1, Math.max(0.05, span * (dir > 0 ? 0.7 : 1 / 0.7)));
-    _chartZoom.start = Math.max(0, center - newSpan / 2);
-    _chartZoom.end   = Math.min(1, _chartZoom.start + newSpan);
-    if (_chartZoom.end > 1) { _chartZoom.end = 1; _chartZoom.start = Math.max(0, 1 - newSpan); }
+// ── Global pan state (must survive chart redraws) ─────────────────────────
+let _pan = {
+    active:    false,
+    startX:    0,
+    startZoom: null,
+    didPan:    false,
+    rafId:     null
+};
+
+// Register document-level pan listeners ONCE, globally
+document.addEventListener('mousemove', function(e) {
+    if (!_pan.active) return;
+    const canvas = document.getElementById('equityChart');
+    if (!canvas) return;
+    const rect      = canvas.getBoundingClientRect();
+    const padding   = 60;
+    const dx        = e.clientX - _pan.startX;
+    const span      = _pan.startZoom.end - _pan.startZoom.start;
+    const dataWidth = rect.width * (1 - 2 * padding / canvas.width);
+    const shift     = -(dx / dataWidth) * span;
+    let newStart = _pan.startZoom.start + shift;
+    let newEnd   = _pan.startZoom.end   + shift;
+    if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+    if (newEnd   > 1) { newStart -= (newEnd - 1); newEnd = 1; }
+    _chartZoom.start = Math.max(0, newStart);
+    _chartZoom.end   = Math.min(1, newEnd);
+    if (Math.abs(dx) > 3) _pan.didPan = true;
+    if (_pan.rafId) cancelAnimationFrame(_pan.rafId);
+    _pan.rafId = requestAnimationFrame(() => { _pan.rafId = null; updateChart(); });
+});
+
+document.addEventListener('mouseup', function(e) {
+    if (!_pan.active) return;
+    _pan.active = false;
+    if (_pan.rafId) { cancelAnimationFrame(_pan.rafId); _pan.rafId = null; }
+    const canvas = document.getElementById('equityChart');
+    if (canvas) canvas.style.cursor = 'grab';
     updateChart();
+});
+
+function zoomChart(dir) {
+    // dir > 0 = zoom in, dir < 0 = zoom out; always anchored to center
+    const span     = _chartZoom.end - _chartZoom.start;
+    const center   = (_chartZoom.start + _chartZoom.end) / 2;
+    const newSpan  = Math.min(1, Math.max(0.03, span * (dir > 0 ? 0.7 : 1 / 0.7)));
+    let newStart   = center - newSpan / 2;
+    let newEnd     = center + newSpan / 2;
+    if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+    if (newEnd   > 1) { newStart -= (newEnd - 1); newEnd = 1; }
+    _chartZoom.start = Math.max(0, newStart);
+    _chartZoom.end   = Math.min(1, newEnd);
+    requestAnimationFrame(updateChart);
 }
 
 function resetZoom() {
@@ -5826,6 +5991,11 @@ function resetZoom() {
 
 function updateChart() {
     drawEnhancedChart('equityChart', 'chartTooltip');
+    // Update zoom level label
+    const span = _chartZoom.end - _chartZoom.start;
+    const zoomPct = Math.round(100 / span);
+    const lbl = document.getElementById('zoomLevelLabel');
+    if (lbl) lbl.textContent = zoomPct <= 100 ? '100%' : zoomPct + '%';
 }
 
 // Add all the missing calendar functions, performance chart functions, etc.
