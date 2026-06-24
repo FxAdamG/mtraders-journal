@@ -1,6 +1,172 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  // ── PASTE YOUR VALUES HERE ──────────────────────────────
+  const SUPABASE_URL = 'https://hgjbmbkbeljrpoqslhaj.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhnamJtYmtiZWxqcnBvcXNsaGFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyODI1MjgsImV4cCI6MjA5Nzg1ODUyOH0._bol7CCwsn7h3c2xV9dUnh29OMp_IYZRViYX8cq4ZJ0';
+  // ────────────────────────────────────────────────────────
+
+  const { createClient } = supabase;
+  const db = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  // Check if user is logged in when the page loads
+  async function checkAuth() {
+    const { data: { session } } = await db.auth.getSession();
+    if (!session) {
+      showLoginScreen();
+    } else {
+      hideLoginScreen();
+    loadFromCloud().then(cloudLoaded => {
+      if (!cloudLoaded) loadData();
+      updateAll();
+    }); // we'll add this in Step 3
+    }
+  }
+
+  // Sign up a new user
+  async function signUp(email, password) {
+    const { error } = await db.auth.signUp({ email, password });
+    if (error) { alert(error.message); return; }
+    alert('Check your email to confirm your account!');
+  }
+
+  // Log in
+  async function logIn(email, password) {
+    const { error } = await db.auth.signInWithPassword({ email, password });
+    if (error) { alert('Wrong email or password'); return; }
+    hideLoginScreen();
+    loadTradesFromDB();
+  }
+
+  // Log out
+  async function logOut() {
+    await db.auth.signOut();
+    showLoginScreen();
+  }
+
+  function showLoginScreen() {
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('main-app').style.display = 'none';
+  }
+
+  function hideLoginScreen() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('main-app').style.display = 'block';
+  }
+
+  window.addEventListener('load', checkAuth);
+  
+  // Load all trades from the database
+  async function loadTradesFromDB() {
+    const { data: trades, error } = await db
+      .from('trades')
+      .select('*')
+      .order('date', { ascending: false });
+
+    if (error) { console.log(error); return; }
+
+    // Clear your current trade list and re-render from DB
+    // This calls whatever function your app uses to display trades
+    window._dbTrades = trades;
+    renderTradesFromDB(trades);
+  }
+
+  // Save a single trade to the database
+  async function saveTradeToDb(trade) {
+    const { data: { user } } = await db.auth.getUser();
+
+    const { error } = await db.from('trades').insert({
+      user_id:     user.id,
+      date:        trade.date,
+      symbol:      trade.symbol,
+      direction:   trade.direction,
+      entry_price: trade.entryPrice,
+      exit_price:  trade.exitPrice,
+      quantity:    trade.quantity,
+      pnl:         trade.pnl,
+      session:     trade.session,
+      setup:       trade.setup,
+      rr:          trade.rr,
+      emotion:     trade.emotion,
+      notes:       trade.notes,
+    });
+
+    if (error) { alert('Error saving trade: ' + error.message); return; }
+    loadTradesFromDB(); // refresh the list
+  }
+
+  // Delete a trade from the database
+  async function deleteTradeFromDb(tradeId) {
+    const { error } = await db.from('trades').delete().eq('id', tradeId);
+    if (error) { alert('Error deleting trade'); return; }
+    loadTradesFromDB();
+  }
+  
+  // Sync ALL trades to Supabase in the background
+  async function syncToCloud() {
+    try {
+      const { data: { user } } = await db.auth.getUser();
+      if (!user) return;
+
+      const tradesClean = trades.map(t => {
+        const { chartImages, chartImage, ...rest } = t;
+        return rest;
+      });
+
+      await db.from('trades').delete().eq('user_id', user.id);
+
+      if (tradesClean.length > 0) {
+        await db.from('trades').insert(
+          tradesClean.map(t => ({ user_id: user.id, data: t }))
+        );
+      }
+    } catch (e) {
+      console.warn('Cloud sync failed:', e.message);
+    }
+  }
+
+  // Load trades from Supabase on login
+  async function loadFromCloud() {
+    try {
+      const { data: { user } } = await db.auth.getUser();
+      if (!user) return false;
+
+      const { data: rows, error } = await db
+        .from('trades')
+        .select('data')
+        .order('created_at', { ascending: true });
+
+      if (error || !rows || rows.length === 0) return false;
+
+      trades = rows.map(r => r.data);
+
+      // Restore chart images from localStorage
+      try {
+        const imgs = localStorage.getItem('tradingJournalImages');
+        if (imgs) {
+          const map = JSON.parse(imgs);
+          Object.keys(map).forEach(i => {
+            if (trades[parseInt(i)]) trades[parseInt(i)].chartImages = map[i];
+          });
+        }
+      } catch(e) {}
+
+      recalculateBalancesAfterTransaction();
+      updateDataStatus(true);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  // Called by old loadTradesFromDB — just refresh the UI
+  function renderTradesFromDB() {
+    updateAll();
+  }
+</script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=1280">
     <title>MTRADERS Private JRNLWEB</title>
@@ -2233,6 +2399,57 @@ body.loading .container { visibility: hidden; }
 </style>
 </head>
 <body class="loading">
+<!-- LOGIN SCREEN -->
+<div id="login-screen" style="
+  display:flex; flex-direction:column; align-items:center;
+  justify-content:center; min-height:100vh;
+  background:#080b0f; font-family:'Space Grotesk',sans-serif;">
+
+  <div style="width:360px; background:#1c2433; border:1px solid rgba(255,255,255,0.09);
+    border-radius:16px; padding:36px;">
+
+    <div style="font-family:'Bebas Neue',sans-serif; font-size:36px;
+      color:#f1f5f9; letter-spacing:0.06em; margin-bottom:6px;">MTRADERS</div>
+    <div style="font-family:'JetBrains Mono',monospace; font-size:11px;
+      color:#00d4aa; letter-spacing:0.2em; margin-bottom:28px;">PRIVATE JOURNAL</div>
+
+    <label style="font-family:'JetBrains Mono',monospace; font-size:10px;
+      color:#64748b; letter-spacing:0.12em; text-transform:uppercase; display:block; margin-bottom:6px;">
+      Email
+    </label>
+    <input id="auth-email" type="email" placeholder="you@email.com" style="
+      width:100%; background:#131920; border:1px solid rgba(255,255,255,0.09);
+      border-radius:8px; padding:11px 14px; font-family:'JetBrains Mono',monospace;
+      font-size:13px; color:#f1f5f9; outline:none; margin-bottom:14px; box-sizing:border-box;"/>
+
+    <label style="font-family:'JetBrains Mono',monospace; font-size:10px;
+      color:#64748b; letter-spacing:0.12em; text-transform:uppercase; display:block; margin-bottom:6px;">
+      Password
+    </label>
+    <input id="auth-pass" type="password" placeholder="••••••••" style="
+      width:100%; background:#131920; border:1px solid rgba(255,255,255,0.09);
+      border-radius:8px; padding:11px 14px; font-family:'JetBrains Mono',monospace;
+      font-size:13px; color:#f1f5f9; outline:none; margin-bottom:20px; box-sizing:border-box;"/>
+
+    <button onclick="logIn(document.getElementById('auth-email').value, document.getElementById('auth-pass').value)"
+      style="width:100%; padding:13px; background:#00d4aa; border:none; border-radius:10px;
+      font-family:'Bebas Neue',sans-serif; font-size:18px; letter-spacing:0.08em;
+      color:#080b0f; cursor:pointer; margin-bottom:10px;">
+      ENTER JOURNAL
+    </button>
+
+    <button onclick="signUp(document.getElementById('auth-email').value, document.getElementById('auth-pass').value)"
+      style="width:100%; padding:11px; background:transparent;
+      border:1px solid rgba(255,255,255,0.09); border-radius:10px;
+      font-family:'JetBrains Mono',monospace; font-size:12px;
+      color:#94a3b8; cursor:pointer;">
+      Create account
+    </button>
+  </div>
+</div>
+
+<!-- YOUR EXISTING APP GOES HERE (wrap it in this div) -->
+<div id="main-app" style="display:none;">
 
 <!-- ═══ PWA INSTALL BANNER ═══ -->
 <div id="installBanner" style="display:none; position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:99999;
@@ -4265,6 +4482,7 @@ function addTrade() {
     
     // Reapply current filter
     filterTrades(currentFilter);
+	syncToCloud(); // save to cloud
 
 }
 
@@ -4838,6 +5056,7 @@ function deleteTrade(index) {
         trades.splice(index, 1);
         recalculateBalances();
         saveData();
+		syncToCloud();
         updateAll();
         updateTradeNumber();
     }
@@ -6082,5 +6301,6 @@ window.addEventListener('load', function() {
 });
 
 </script>
+</div>
 </body>
 </html>
